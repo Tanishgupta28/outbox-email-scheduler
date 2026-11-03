@@ -5,11 +5,15 @@ import { db, emails, type Email } from "./db.js";
 export const redis = new Redis(config.REDIS_URL, {
   maxRetriesPerRequest: 1,
   enableOfflineQueue: false,
+  commandTimeout: 2000,
 });
 redis.on("error", () => {});
 export const queue = new Queue(config.QUEUE_NAME, { connection: redis });
 queue.on("error", () => {});
 export async function enqueue(email: Email) {
+  // BullMQ waits for initial Redis readiness. Fail fast here so a Redis outage
+  // cannot hold the HTTP response open after the database has committed.
+  if (redis.status !== "ready") throw new Error("Queue is not ready");
   await queue.add(
     "deliver",
     { emailId: email.id },
@@ -26,6 +30,7 @@ export async function enqueue(email: Email) {
 // MySQL rows are the durable outbox. Stable IDs make repeated enqueue safe.
 // Scan in pages so an old pending row cannot starve newer schedules.
 export async function reconcile() {
+  if (redis.status !== "ready") throw new Error("Queue is not ready");
   let after = "";
   while (true) {
     const rows = await emails(

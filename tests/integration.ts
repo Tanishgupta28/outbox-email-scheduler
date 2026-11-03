@@ -1,7 +1,8 @@
 // Runs real MySQL, Redis, API and worker processes. Only SMTP is faked by default.
 import "dotenv/config";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execFile, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import { once } from "node:events";
 import { mkdir, writeFile } from "node:fs/promises";
 import mysql from "mysql2/promise";
@@ -11,7 +12,7 @@ const dbName = `outbox_test_${Date.now()}`;
 const adminUrl =
   process.env.TEST_ADMIN_DATABASE_URL ||
   "mysql://root:outbox_root_local@127.0.0.1:3307/mysql";
-const admin = await mysql.createConnection(adminUrl);
+let admin = await mysql.createConnection(adminUrl);
 await admin.query(`CREATE DATABASE \`${dbName}\``);
 const databaseUrl = new URL(adminUrl);
 databaseUrl.pathname = `/${dbName}`;
@@ -84,6 +85,7 @@ async function login(email = "tanish@outbox.demo") {
 }
 async function request(path: string, cookie: string, body?: unknown) {
   return fetch(`${base}/api${path}`, {
+    signal: AbortSignal.timeout(15000),
     method: body ? "POST" : "GET",
     headers: { cookie, "content-type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
@@ -191,6 +193,35 @@ try {
   pass(
     "Email becoming due while both processes offline recovered automatically",
   );
+  if (process.argv.includes("--restart-services")) {
+    const durable = await schedule(
+      cookie,
+      "Survives database and Redis restart",
+      3000,
+    );
+    await stop(api);
+    await stop(worker);
+    await admin.end();
+    await promisify(execFile)("docker", [
+      "compose",
+      "restart",
+      "mysql",
+      "redis",
+    ]);
+    await until(async () => {
+      const candidate = await mysql.createConnection(adminUrl);
+      await candidate.query("SELECT 1");
+      admin = candidate;
+      return true;
+    }, 60000);
+    api = start("server");
+    worker = start("worker");
+    await ready();
+    await sent(cookie, durable.id);
+    pass(
+      "MySQL and Redis container restart retained schedule and delivered original email",
+    );
+  }
   await stop(api);
   await stop(worker);
   api = start("server", { REDIS_URL: "redis://127.0.0.1:6399" });
@@ -207,6 +238,10 @@ try {
   await ready();
   await sent(cookie, repair.id);
   pass("MySQL commit with failed enqueue recovered by reconciliation");
+  // Let the previous message's fixed limiter window expire. Otherwise a batch
+  // can legitimately straddle its boundary and have a shorter acceptance span.
+  await sleep(2700);
+  const secondWorker = start("worker");
   const batch = [];
   for (let i = 0; i < 5; i++)
     batch.push(await schedule(cookie, `Rate batch ${i + 1}`, 2000));
@@ -221,6 +256,7 @@ try {
   pass(
     `Rate limit across 5 emails: ${times[4] - times[0]} ms spread (2 starts / 2500 ms)`,
   );
+  await stop(secondWorker);
   if (real) {
     await stop(worker);
     worker = start("worker", {
