@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+tmp/
+test-results/
+playwright-report/
+*.log
+submission/*.aux
+submission/*.out
+submission/*.log
+.tools/

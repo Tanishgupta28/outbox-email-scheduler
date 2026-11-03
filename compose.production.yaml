@@ -1,0 +1,74 @@
+# Standalone production stack: docker compose -f compose.production.yaml up -d --build
+name: outbox-production
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set a unique root password}
+      MYSQL_DATABASE: outbox
+      MYSQL_USER: outbox
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set a unique database password}
+    volumes: ["mysql_data:/var/lib/mysql"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    volumes: ["redis_data:/data"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  migrate:
+    build: .
+    env_file: .env
+    environment: &app_env
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: mysql://outbox:${MYSQL_PASSWORD}@mysql:3306/outbox
+      REDIS_URL: redis://redis:6379
+      APP_ORIGIN: https://${PUBLIC_DOMAIN:?Set your public DNS hostname}
+    command: ["node", "dist/backend/migrate.js"]
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  api:
+    build: .
+    env_file: .env
+    environment: *app_env
+    restart: unless-stopped
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  worker:
+    build: .
+    env_file: .env
+    environment: *app_env
+    command: ["node", "dist/backend/worker.js"]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+  proxy:
+    image: caddy:2-alpine
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN}
+    ports: ["80:80", "443:443"]
+    volumes: ["./deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "caddy_data:/data", "caddy_config:/config"]
+    restart: unless-stopped
+    depends_on: [api]
+volumes:
+  mysql_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

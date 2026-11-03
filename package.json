@@ -1,0 +1,47 @@
+{
+  "name": "outbox-email-scheduler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:api": "tsx watch backend/src/server.ts",
+    "dev:worker": "tsx watch backend/src/worker.ts",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "tsc -p tsconfig.backend.json && tsc -p tsconfig.json && vite build",
+    "start:api": "node dist/backend/server.js",
+    "start:worker": "node dist/backend/worker.js",
+    "db:migrate": "tsx backend/src/migrate.ts",
+    "ethereal:setup": "tsx scripts/ethereal.ts",
+    "test": "tsx tests/integration.ts",
+    "test:ethereal": "tsx tests/integration.ts --ethereal",
+    "format": "prettier --write backend frontend scripts tests *.json vite.config.ts"
+  },
+  "dependencies": {
+    "bullmq": "^5.63.0",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.2.1",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.8.2",
+    "mysql2": "^3.15.3",
+    "nodemailer": "^10.3.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^5.0.5",
+    "@types/node": "^22.19.0",
+    "@types/nodemailer": "^7.0.4",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.1.0",
+    "prettier": "^3.9.10",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.2"
+  }
+}
