@@ -33,7 +33,7 @@ Tests ran on Tanish's Windows machine in PowerShell with Node 22.18.0, Docker De
 
 The first build needed `DOM.Iterable` in TypeScript's frontend libraries. The first dependency audit flagged the older Nodemailer range, which was upgraded. The first Redis-outage run revealed that BullMQ's initial readiness wait could hold an HTTP response after committing MySQL; the producer now checks Redis readiness and has a command timeout. An initial rate-limit assertion incorrectly included a preceding partially consumed window; the test now starts measurement after that window expires. The affected suites were rerun successfully.
 
-An early GitHub Actions run for the pre-fix commit was cancelled after detecting the Redis-outage wait. Later CI status is available under the repository's Actions tab; local passing evidence above is independent of CI.
+An early GitHub Actions run for the pre-fix commit was cancelled after detecting the Redis-outage wait. The [subsequent GitHub Actions run](https://github.com/Tanishgupta28/outbox-email-scheduler/actions/runs/41678885011) passed on Linux: clean `npm ci`, build, MySQL/Redis integration suite and Chromium flow. Local passing evidence above is independent of CI.
 
 ## Limits of the evidence
 
