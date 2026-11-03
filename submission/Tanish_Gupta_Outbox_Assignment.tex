@@ -1,0 +1,54 @@
+\documentclass[11pt,a4paper]{article}
+% Update these three commands with verified links. Empty means pending.
+\newcommand{\HostedURL}{}
+\newcommand{\VideoURL}{}
+\newcommand{\RepositoryURL}{https://github.com/Tanishgupta28/outbox-email-scheduler}
+
+\usepackage[margin=24mm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{xcolor}
+\usepackage{etoolbox}
+\definecolor{LinkBlue}{HTML}{377AA4}
+\definecolor{Ink}{HTML}{203447}
+\definecolor{Muted}{HTML}{536574}
+\definecolor{PaleBlue}{HTML}{EDF5FB}
+\usepackage[colorlinks=true,urlcolor=LinkBlue,linkcolor=LinkBlue,pdfauthor={Tanish Gupta},pdftitle={Outbox Labs | Software Development Engineer Intern Assignment}]{hyperref}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{10pt}
+\renewcommand{\familydefault}{\sfdefault}
+\newif\ifdraftsubmission
+\ifdefempty{\HostedURL}{\draftsubmissiontrue}{}
+\ifdefempty{\VideoURL}{\draftsubmissiontrue}{}
+\ifdefempty{\RepositoryURL}{\draftsubmissiontrue}{}
+\newcommand{\submissionlink}[3]{\ifdefempty{#2}{\textbf{#1}\par\textcolor{Muted}{#3}}{\href{#2}{\textbf{#1}\enspace$\rightarrow$}}\par\vspace{12pt}}
+\begin{document}
+\color{Ink}
+{\small\textbf{OUTBOX LABS}\hfill ENGINEERING ASSIGNMENT}
+\vspace{12pt}
+\hrule height 0.6pt
+\vspace{22pt}
+{\LARGE\bfseries\raggedright Outbox Labs | Software Development\\Engineer Intern Assignment\par}
+\vspace{12pt}
+{\large Tanish Gupta\par}
+\vspace{12pt}
+{\huge\bfseries Email Scheduling Dashboard\par}
+\vspace{8pt}
+A responsive React and TypeScript dashboard schedules test emails through an Express API, MySQL persistence, and a separate Redis/BullMQ worker. Durable queue recovery, configurable rate limits, bounded retries, and Ethereal SMTP previews make scheduling and delivery status easy to demonstrate across process restarts.
+
+\ifdraftsubmission
+\vspace{4pt}
+\colorbox{PaleBlue}{\parbox{\dimexpr\linewidth-2\fboxsep}{\vspace{7pt}\textbf{Draft --- submission links pending.}\vspace{7pt}}}\par
+\fi
+\vspace{14pt}
+\submissionlink{Open the hosted assignment}{\HostedURL}{Pending: verified live deployment URL.}
+\submissionlink{Watch the demo video}{\VideoURL}{Pending: reviewer-accessible demo video URL.}
+\submissionlink{View the private GitHub repository}{\RepositoryURL}{Pending: verified private repository URL.}
+\vspace{6pt}
+\textbf{Reviewer access}\par
+Use the prefilled public demo login and click \textit{Log in}. The README documents a second demo identity for testing inbox isolation. GitHub reviewers must accept their repository invitations before opening the private source.
+
+\vfill
+{\small\color{Muted}Ethereal is a test mailbox. ``Sent'' records SMTP acceptance; delivery is at-least-once, with a documented duplicate risk after an ambiguous worker crash.}
+\end{document}
