@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { z } from "zod";
 import "./style.css";
 type User = { id: string; name: string; email: string };
 type Email = {
@@ -8,7 +9,7 @@ type Email = {
   subject: string;
   body: string;
   scheduled_at: string;
-  status: "scheduled" | "processing" | "sent" | "failed";
+  status: "scheduled" | "processing" | "sent" | "failed" | "cancelled";
   attempts: number;
   sent_at: string | null;
   preview_url: string | null;
@@ -40,12 +41,33 @@ function App() {
     [compose, setCompose] = useState(false),
     [notice, setNotice] = useState(""),
     [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
+    [busy, setBusy] = useState(false),
+    [cancelling, setCancelling] = useState<string | null>(null),
+    [cancelError, setCancelError] = useState(""),
+    [recipientAlert, setRecipientAlert] = useState(false);
+  const recipientRef = useRef<HTMLInputElement>(null);
+  const recipientTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshVersion = useRef(0);
+  function clearRecipientAlert() {
+    if (recipientTimer.current) clearTimeout(recipientTimer.current);
+    recipientTimer.current = null;
+    setRecipientAlert(false);
+  }
+  useEffect(() => {
+    if (!compose) clearRecipientAlert();
+    return () => {
+      if (recipientTimer.current) clearTimeout(recipientTimer.current);
+    };
+  }, [compose]);
   const refresh = async () => {
+    const version = ++refreshVersion.current;
     try {
-      setRows(await api("/emails"));
+      const emails = await api("/emails");
+      if (version !== refreshVersion.current) return;
+      setRows(emails);
       setError("");
     } catch (e) {
+      if (version !== refreshVersion.current) return;
       setError((e as Error).message);
     }
   };
@@ -81,6 +103,18 @@ function App() {
   }
   async function schedule(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const form = event.currentTarget;
+    // noValidate lets both click and Enter reach this handler, even when the
+    // browser would otherwise intercept type=email before React sees submit.
+    if (!z.email().max(254).safeParse(recipientRef.current?.value).success) {
+      clearRecipientAlert();
+      setRecipientAlert(true);
+      recipientTimer.current = setTimeout(() => setRecipientAlert(false), 6000);
+      recipientRef.current?.focus();
+      return;
+    }
+    clearRecipientAlert();
+    if (!form.reportValidity()) return;
     setBusy(true);
     setError("");
     const data = Object.fromEntries(new FormData(event.currentTarget));
@@ -104,6 +138,28 @@ function App() {
       setError((e as Error).message);
     } finally {
       setBusy(false);
+    }
+  }
+  async function cancelEmail(email: Email) {
+    if (
+      !window.confirm(
+        `Cancel email "${email.subject}"? This email will not be sent.`,
+      )
+    )
+      return;
+    setCancelling(email.id);
+    setCancelError("");
+    try {
+      await api(`/emails/${email.id}/cancel`, { method: "POST" });
+      // Discard any poll started before the cancellation committed.
+      ++refreshVersion.current;
+      setRows((current) => current.filter((row) => row.id !== email.id));
+      setNotice("Email cancelled.");
+    } catch (e) {
+      setCancelError((e as Error).message);
+      await refresh();
+    } finally {
+      setCancelling(null);
     }
   }
   const counts = {
@@ -257,6 +313,11 @@ function App() {
             {error}
           </p>
         )}
+        {cancelError && (
+          <p role="alert" className="error">
+            {cancelError}
+          </p>
+        )}
         <section className="inbox">
           <div className="table-top">
             <nav aria-label="Email status">
@@ -284,6 +345,7 @@ function App() {
                   <th>{tab === "sent" ? "Sent at" : "Scheduled for"}</th>
                   <th>Status</th>
                   <th>Delivery</th>
+                  {tab === "scheduled" && <th>Actions</th>}
                 </tr>
               </thead>
               <tbody>
@@ -321,6 +383,23 @@ function App() {
                           : "Waiting for delivery")
                       )}
                     </td>
+                    {tab === "scheduled" && (
+                      <td>
+                        {row.status === "scheduled" && row.attempts === 0 ? (
+                          <button
+                            className="secondary"
+                            disabled={cancelling !== null}
+                            onClick={() => void cancelEmail(row)}
+                          >
+                            {cancelling === row.id
+                              ? "Cancelling…"
+                              : "Cancel email"}
+                          </button>
+                        ) : (
+                          "Too late to cancel"
+                        )}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -370,10 +449,16 @@ function App() {
                 ×
               </button>
             </div>
-            <form onSubmit={schedule}>
+            {recipientAlert && (
+              <div role="alert" className="error recipient-popup">
+                Please enter a valid email address.
+              </div>
+            )}
+            <form onSubmit={schedule} noValidate>
               <label>
                 Recipient
                 <input
+                  ref={recipientRef}
                   autoFocus
                   name="recipient"
                   type="email"

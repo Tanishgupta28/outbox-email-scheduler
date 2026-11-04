@@ -16,6 +16,8 @@ const transport =
     : null;
 export async function deliver(email: Email): Promise<string | null> {
   if (!transport) {
+    // Test evidence records transport entry, including rejected attempts.
+    console.log(`Fake transport invoked email ${email.id}`);
     if (email.recipient === "fail@example.com")
       throw new Error("Simulated SMTP rejection");
     await new Promise((r) => setTimeout(r, 50));

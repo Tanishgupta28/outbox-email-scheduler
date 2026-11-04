@@ -5,10 +5,17 @@ import rateLimit from "express-rate-limit";
 import { randomBytes, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { z } from "zod";
+import type { ResultSetHeader } from "mysql2/promise";
 import { config } from "./config.js";
 import { db, emails } from "./db.js";
 import { verifyPassword, tokenHash } from "./auth.js";
-import { enqueue, queue, redis, startReconciler } from "./queue.js";
+import {
+  enqueue,
+  removeQueuedEmail,
+  queue,
+  redis,
+  startReconciler,
+} from "./queue.js";
 const app = express();
 app.use(helmet(), express.json({ limit: "32kb" }), cookieParser());
 app.use("/api", (req, res, next) => {
@@ -96,6 +103,39 @@ app.get("/api/emails", async (_req, res) =>
     ),
   ),
 );
+app.post("/api/emails/:id/cancel", async (req, res) => {
+  // This update and the worker's claim compete for the same InnoDB row lock.
+  // Once any send attempt starts, its SMTP outcome could be unknown: do not
+  // promise cancellation even if that attempt later returns to retry pending.
+  const [result] = await db.query<ResultSetHeader>(
+    "UPDATE emails SET status='cancelled',last_error=NULL WHERE id=? AND user_id=? AND status='scheduled' AND attempts=0",
+    [req.params.id, res.locals.user.id],
+  );
+  if (!result.affectedRows) {
+    const [email] = await emails(
+      "SELECT * FROM emails WHERE id=? AND user_id=?",
+      [req.params.id, res.locals.user.id],
+    );
+    if (!email) return res.status(404).json({ error: "Email not found" });
+    if (email.status !== "cancelled")
+      return res
+        .status(409)
+        .json({
+          error:
+            "It is too late to cancel this email; delivery has already started or finished.",
+        });
+  }
+  // Durable cancellation is already committed. Redis cleanup is best effort;
+  // retained or active jobs still have to pass the worker's database claim.
+  try {
+    await removeQueuedEmail(req.params.id);
+  } catch {
+    console.error(
+      "Cancelled email queue cleanup unavailable; database guard remains active.",
+    );
+  }
+  res.json({ id: req.params.id, status: "cancelled" });
+});
 const scheduleSchema = z.object({
   recipient: z.email().max(254),
   subject: z.string().trim().min(1).max(200),
@@ -108,12 +148,10 @@ app.post(
   async (req, res) => {
     const parsed = scheduleSchema.safeParse(req.body);
     if (!parsed.success)
-      return res
-        .status(400)
-        .json({
-          error:
-            "Enter a valid recipient, subject, body and ISO date with a time zone",
-        });
+      return res.status(400).json({
+        error:
+          "Enter a valid recipient, subject, body and ISO date with a time zone",
+      });
     const { recipient, subject, body, scheduledAt } = parsed.data;
     const scheduled = new Date(scheduledAt);
     if (scheduled.getTime() <= Date.now())
@@ -150,12 +188,9 @@ app.use(
     _next: express.NextFunction,
   ) => {
     console.error("Request failed");
-    res
-      .status(500)
-      .json({
-        error:
-          "Service temporarily unavailable; please refresh before retrying",
-      });
+    res.status(500).json({
+      error: "Service temporarily unavailable; please refresh before retrying",
+    });
   },
 );
 const stopReconciler = startReconciler();

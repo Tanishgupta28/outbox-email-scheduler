@@ -4,9 +4,11 @@ import assert from "node:assert/strict";
 import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { once } from "node:events";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import mysql from "mysql2/promise";
-import { chromium } from "@playwright/test";
+import { chromium, expect } from "@playwright/test";
+import { Queue } from "bullmq";
+import { Redis } from "ioredis";
 const real = process.argv.includes("--ethereal");
 const dbName = `outbox_test_${Date.now()}`;
 const adminUrl =
@@ -34,6 +36,8 @@ const children = new Set<ChildProcess>();
 const logs: string[] = [];
 const results: string[] = [];
 const base = "http://127.0.0.1:3002";
+const testRedis = new Redis(env.REDIS_URL!);
+const testQueue = new Queue(dbName, { connection: testRedis });
 function start(file: string, override: Record<string, string> = {}) {
   const child = spawn(process.execPath, [`dist/backend/${file}.js`], {
     env: { ...env, ...override },
@@ -124,10 +128,34 @@ function pass(message: string) {
   console.log(`PASS ${message}`);
 }
 try {
+  // Upgrade an existing v1 database, not just an empty schema.
+  await admin.query(`USE \`${dbName}\``);
+  const initial = await readFile("backend/migrations/001_initial.sql", "utf8");
+  for (const statement of initial.split(";").filter((s) => s.trim()))
+    await admin.query(statement);
+  await admin.query(
+    "INSERT INTO users VALUES('legacy','legacy@example.com','Legacy','preserved-hash')",
+  );
+  await admin.query(
+    "INSERT INTO emails(id,user_id,recipient,subject,body,scheduled_at,status,attempts,sent_at) VALUES('legacy-email','legacy','old@example.com','Preserved subject','Preserved body',UTC_TIMESTAMP(3),'sent',1,UTC_TIMESTAMP(3))",
+  );
+  const [legacyBefore] = await admin.query(
+    "SELECT * FROM emails WHERE id='legacy-email'",
+  );
   const migration = start("migrate");
   const [exit] = await once(migration, "exit");
   children.delete(migration);
   assert.equal(exit, 0);
+  const repeatedMigration = start("migrate");
+  assert.equal((await once(repeatedMigration, "exit"))[0], 0);
+  children.delete(repeatedMigration);
+  const [legacyAfter] = await admin.query(
+    "SELECT * FROM emails WHERE id='legacy-email'",
+  );
+  assert.deepEqual(legacyAfter, legacyBefore);
+  pass(
+    "Migration upgrades existing schema and preserves records; rerun is safe",
+  );
   let api = start("server"),
     worker = start("worker");
   await ready();
@@ -284,6 +312,144 @@ try {
     await stop(worker);
     worker = start("worker");
   }
+  await stop(worker);
+  const cancellable = await schedule(cookie, "Owner-only cancellation", 60000);
+  const cancelPath = `/emails/${cancellable.id}/cancel`;
+  assert.equal((await request(cancelPath, "", {})).status, 401);
+  assert.equal((await request(cancelPath, other, {})).status, 404);
+  assert.equal(
+    (await request("/emails/missing/cancel", cookie, {})).status,
+    404,
+  );
+  assert.equal(
+    (await list(cookie)).find((r) => r.id === cancellable.id).status,
+    "scheduled",
+  );
+  const cancellations = await Promise.all([
+    request(cancelPath, cookie, {}),
+    request(cancelPath, cookie, {}),
+  ]);
+  assert.deepEqual(
+    cancellations.map((r) => r.status),
+    [200, 200],
+  );
+  assert.equal((await request(cancelPath, cookie, {})).status, 200);
+  assert.equal((await request(cancelPath, other, {})).status, 404);
+  assert.equal(await testQueue.getJob(`email-${cancellable.id}`), undefined);
+  assert.equal(
+    (await request(`/emails/${future.id}/cancel`, cookie, {})).status,
+    409,
+  );
+  assert.equal(
+    (await request(`/emails/${failed.id}/cancel`, cookie, {})).status,
+    409,
+  );
+  pass(
+    "Cancellation requires authentication and ownership; concurrent/repeated requests are idempotent; sent/failed records return 409; queued job removed",
+  );
+
+  // Force both real database race orderings. A third connection holds the row
+  // while API/worker queue their competing UPDATEs; inspect actual lock waits
+  // rather than guessing timing. The worker reads the pre-cancel snapshot.
+  async function waitingFor(id: string, fragment: string) {
+    await until(async () => {
+      const [transactions]: any = await admin.query(
+        "SELECT trx_query FROM information_schema.innodb_trx WHERE trx_state='LOCK WAIT'",
+      );
+      return transactions.some(
+        (t: any) => t.trx_query?.includes(id) && t.trx_query.includes(fragment),
+      );
+    }, 10000);
+  }
+  for (const winner of ["cancel", "worker"]) {
+    const racing = await schedule(cookie, `Race won by ${winner}`, 500);
+    const blocker = await mysql.createConnection(databaseUrl.toString());
+    let cancellation: Promise<Response>;
+    try {
+      await blocker.beginTransaction();
+      await blocker.query("SELECT * FROM emails WHERE id=? FOR UPDATE", [
+        racing.id,
+      ]);
+      if (winner === "cancel") {
+        cancellation = request(`/emails/${racing.id}/cancel`, cookie, {});
+        await waitingFor(racing.id, "status='cancelled'");
+        worker = start("worker");
+        await waitingFor(racing.id, "attempts=attempts+1");
+      } else {
+        worker = start("worker");
+        await waitingFor(racing.id, "attempts=attempts+1");
+        cancellation = request(`/emails/${racing.id}/cancel`, cookie, {});
+        await waitingFor(racing.id, "status='cancelled'");
+      }
+      assert.equal(
+        await (await testQueue.getJob(`email-${racing.id}`))!.getState(),
+        "active",
+      );
+      await blocker.commit();
+      const response = await cancellation;
+      assert.equal(response.status, winner === "cancel" ? 200 : 409);
+      if (winner === "cancel") {
+        await until(async () => {
+          const job = await testQueue.getJob(`email-${racing.id}`);
+          return !job || (await job.getState()) === "completed";
+        });
+        const row = (await list(cookie)).find((r) => r.id === racing.id);
+        assert.equal(row.status, "cancelled");
+        assert.equal(row.attempts, 0);
+        assert.ok(
+          !logs.join("").includes(`transport invoked email ${racing.id}`),
+        );
+      } else {
+        assert.match((await response.json()).error, /too late to cancel/);
+        await sent(cookie, racing.id);
+      }
+    } finally {
+      await blocker.rollback();
+      await blocker.end();
+      await stop(worker);
+    }
+  }
+  pass(
+    "Real API/worker row-lock races: cancellation wins after worker reads stale state; worker claim wins with 409 and delivery",
+  );
+
+  const cleanupFailure = await schedule(
+    cookie,
+    "Cancel despite Redis outage",
+    2500,
+  );
+  await stop(api);
+  api = start("server", { REDIS_URL: "redis://127.0.0.1:6399" });
+  await ready();
+  assert.equal(
+    (await request(`/emails/${cleanupFailure.id}/cancel`, cookie, {})).status,
+    200,
+  );
+  assert.ok(await testQueue.getJob(`email-${cleanupFailure.id}`));
+  await stop(api);
+  api = start("server");
+  worker = start("worker");
+  await ready();
+  await until(
+    async () =>
+      (await (await testQueue.getJob(
+        `email-${cleanupFailure.id}`,
+      ))!.getState()) === "completed",
+  );
+  const cancelled = (await list(cookie)).find(
+    (r) => r.id === cleanupFailure.id,
+  );
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.attempts, 0);
+  assert.equal(cancelled.sent_at, null);
+  assert.ok(!logs.join("").includes(`transport invoked email ${cancelled.id}`));
+  await (await testQueue.getJob(`email-${cancelled.id}`))!.remove();
+  await sleep(1000);
+  assert.equal(await testQueue.getJob(`email-${cancelled.id}`), undefined);
+  pass(
+    "Redis cleanup failure leaves a job that worker safely skips after API/worker restart; recovery never recreates cancelled job",
+  );
+
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage({
@@ -291,8 +457,196 @@ try {
     });
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(e.message));
+    // Install before app code creates timers. Pause after loading so popup
+    // deadlines can be asserted without relying on wall-clock sleeps.
+    await page.clock.install({ time: Date.now() - 60000 });
     await page.goto(base);
     await page.getByRole("button", { name: "Log in →" }).click();
+    await page.getByRole("button", { name: "＋ Compose email" }).click();
+    const recipient = page.getByLabel("Recipient", { exact: true });
+    const subject = page.getByLabel("Subject", { exact: true });
+    const message = page.getByLabel("Message", { exact: true });
+    const delivery = page.getByLabel("Delivery date and time");
+    const submit = page.getByRole("button", { name: "Schedule email →" });
+    const localTime = (delay: number) => {
+      const date = new Date(Date.now() + delay);
+      return new Date(date.getTime() - date.getTimezoneOffset() * 60000)
+        .toISOString()
+        .slice(0, 19);
+    };
+    let scheduleRequests = 0;
+    page.on("request", (r) => {
+      if (r.method() === "POST" && new URL(r.url()).pathname === "/api/emails")
+        scheduleRequests++;
+    });
+    await recipient.fill("browser@example.com");
+    await message.fill("All my typed content must survive validation.");
+    // Check native required fields before the popup flow so correcting the
+    // recipient later is the only change made to the retained draft.
+    await delivery.fill(localTime(45000));
+    await submit.click();
+    await expect(subject).toBeFocused();
+    await subject.fill("Browser cancellation — preserve draft");
+    await message.fill("");
+    await submit.click();
+    await expect(message).toBeFocused();
+    await message.fill("All my typed content must survive validation.");
+    await delivery.fill("");
+    await submit.click();
+    await expect(delivery).toBeFocused();
+    assert.equal(scheduleRequests, 0);
+    const draftDate = localTime(45000);
+    await delivery.fill(draftDate);
+    await recipient.fill("abc");
+    await page.clock.pauseAt(Date.now());
+    await submit.click();
+    const popup = page
+      .getByRole("alert")
+      .filter({ hasText: "Please enter a valid email address." });
+    await expect(popup).toBeVisible();
+    await expect(recipient).toBeFocused();
+    await page.screenshot({
+      path: "test-results/invalid-recipient-popup.png",
+      fullPage: true,
+    });
+    await page.clock.runFor(5000);
+    await expect(popup).toBeVisible();
+    await page.clock.runFor(2000);
+    await expect(popup).toBeHidden();
+    // Enter uses the same handler. A repeated invalid submission must reset
+    // the single alert's deadline, even after five seconds have elapsed.
+    await recipient.fill("name@");
+    await recipient.press("Enter");
+    await expect(popup).toBeVisible();
+    await page.clock.runFor(5000);
+    await expect(popup).toBeVisible();
+    await recipient.press("Enter");
+    await expect(popup).toHaveCount(1);
+    await expect(recipient).toBeFocused();
+    await page.clock.runFor(5000);
+    await expect(popup).toBeVisible();
+    await page.clock.runFor(999);
+    await expect(popup).toBeVisible();
+    await page.clock.runFor(1);
+    await expect(popup).toBeHidden();
+    await page.clock.runFor(1000);
+    await expect(popup).toBeHidden();
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await expect(recipient).toHaveValue("name@");
+    await expect(subject).toHaveValue("Browser cancellation — preserve draft");
+    await expect(message).toHaveValue(
+      "All my typed content must survive validation.",
+    );
+    await expect(delivery).toHaveValue(draftDate);
+    assert.equal(scheduleRequests, 0);
+    // Rejoin server time for real scheduling and the later worker checks.
+    await page.clock.setSystemTime(Date.now());
+    await page.clock.resume();
+    await recipient.fill("browser@example.com");
+    await expect(delivery).toHaveValue(draftDate);
+    const browserTiming = await delivery.evaluate(
+      (input: HTMLInputElement) => ({
+        scheduledAt: new Date(input.value).getTime(),
+        now: Date.now(),
+      }),
+    );
+    // The API's HTTP Date header uses its real Node clock, unaffected by
+    // page.clock. The test runner shares that clock and checks milliseconds.
+    const serverResponse = await request("/me", cookie);
+    const serverNow = Date.parse(serverResponse.headers.get("date")!);
+    assert.ok(Number.isFinite(serverNow), "API must expose its real HTTP Date");
+    assert.ok(
+      browserTiming.scheduledAt > browserTiming.now + 5000,
+      "Retained delivery time must be future according to the browser clock",
+    );
+    assert.ok(
+      browserTiming.scheduledAt > serverNow + 5000 &&
+        browserTiming.scheduledAt > Date.now() + 5000,
+      "Retained delivery time must be future according to the real backend clock",
+    );
+    const scheduledResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === "/api/emails",
+    );
+    await submit.click();
+    const response = await scheduledResponse;
+    assert.equal(response.status(), 201);
+    const scheduledEmail = await response.json();
+    assert.equal(
+      new Date(scheduledEmail.scheduled_at).getTime(),
+      browserTiming.scheduledAt,
+    );
+    assert.equal(scheduledEmail.recipient, "browser@example.com");
+    assert.equal(
+      scheduledEmail.subject,
+      "Browser cancellation — preserve draft",
+    );
+    assert.equal(
+      scheduledEmail.body,
+      "All my typed content must survive validation.",
+    );
+    assert.equal(scheduleRequests, 1);
+    await expect(page.getByRole("dialog")).toBeHidden();
+    const cancelRow = page
+      .getByRole("row")
+      .filter({ hasText: "Browser cancellation — preserve draft" });
+    await expect(cancelRow).toBeVisible();
+    const uiEmail = (await list(cookie)).find(
+      (r) => r.subject === "Browser cancellation — preserve draft",
+    );
+    assert.equal(uiEmail.id, scheduledEmail.id);
+    assert.equal(uiEmail.status, "scheduled");
+    pass(
+      "Chromium with controlled clock: invalid popup visible at 5s, gone by 7s; Enter restarts one alert until exactly 6s; retained draft time is future for browser and backend; correcting only recipient schedules with HTTP 201 and Scheduled row; required validation preserved",
+    );
+    page.once("dialog", async (dialog) => {
+      assert.equal(dialog.type(), "confirm");
+      assert.ok(dialog.message().includes(uiEmail.subject));
+      await dialog.dismiss();
+    });
+    await cancelRow
+      .getByRole("button", { name: "Cancel email", exact: true })
+      .click();
+    await expect(cancelRow).toBeVisible();
+    assert.equal(
+      (await list(cookie)).find((r) => r.id === uiEmail.id).status,
+      "scheduled",
+    );
+    page.once("dialog", (dialog) => dialog.accept());
+    await cancelRow
+      .getByRole("button", { name: "Cancel email", exact: true })
+      .click();
+    await expect(page.getByRole("status")).toContainText("Email cancelled.");
+    await expect(cancelRow).toHaveCount(0);
+    await page.reload();
+    await expect(
+      page.getByRole("button", { name: "＋ Compose email" }),
+    ).toBeVisible();
+    await expect(cancelRow).toHaveCount(0);
+    await stop(api);
+    await stop(worker);
+    api = start("server");
+    worker = start("worker");
+    await ready();
+    await sleep(
+      Math.max(0, new Date(uiEmail.scheduled_at).getTime() - Date.now()) + 1500,
+    );
+    const uiCancelled = (await list(cookie)).find((r) => r.id === uiEmail.id);
+    assert.equal(uiCancelled.status, "cancelled");
+    assert.equal(uiCancelled.attempts, 0);
+    assert.equal(uiCancelled.sent_at, null);
+    assert.equal(await testQueue.getJob(`email-${uiEmail.id}`), undefined);
+    assert.ok(!logs.join("").includes(`transport invoked email ${uiEmail.id}`));
+    await page.reload();
+    await expect(
+      page.getByRole("button", { name: "＋ Compose email" }),
+    ).toBeVisible();
+    await expect(cancelRow).toHaveCount(0);
+    pass(
+      "Chromium: confirmation names subject; dismiss leaves email unchanged; confirmed cancellation survives refresh and API/worker restart past due time without transport invocation",
+    );
+
     await page.getByRole("button", { name: "＋ Compose email" }).click();
     await page
       .getByLabel("Recipient", { exact: true })
@@ -378,8 +732,9 @@ try {
   process.exitCode = 1;
 } finally {
   for (const child of children) await stop(child);
+  await testQueue.close();
+  await testRedis.quit();
   // Delete only this run's queue keys. Never FLUSHDB shared Redis.
-  const { Redis } = await import("ioredis");
   const redis = new Redis(env.REDIS_URL!);
   let cursor = "0";
   do {

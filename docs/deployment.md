@@ -1,5 +1,22 @@
 # Hosting the complete stack
 
+## Upgrading for cancellation
+
+Stop **all old API and worker instances** before enabling this feature. Old workers do not recognize `cancelled` and must not overlap with the new cancellation endpoint. On the deployment host, after obtaining the updated source:
+
+```sh
+docker compose -f compose.production.yaml stop api worker
+docker compose -f compose.production.yaml build api worker migrate
+docker compose -f compose.production.yaml run --rm migrate
+docker compose -f compose.production.yaml up -d api worker
+```
+
+Migration `002_cancelled_status.sql` appends the terminal enum value and preserves existing emails, users and sessions. MySQL and Redis remain running with their volumes. If migration/build fails, leave API/worker stopped until resolved. For local Node processes, stop both, run `npm.cmd run db:migrate` and `npm.cmd run build`, then restart both. Once cancellation records exist, rollback must retain a worker that recognizes them.
+
+Verify a future email's confirmation can be dismissed, then confirm cancellation, reload, restart the worker, and check that the email remains cancelled after its due time. The integration suite performs this flow against isolated local data, including transport-entry assertions with fake SMTP. It also tests cancellation racing with the real worker's database claim and Redis cleanup failure.
+
+## Initial deployment notes (3 November 2026)
+
 No suitable authenticated container hosting account was found during implementation. The connected Sites runtime uses Cloudflare Workers and does not support this persistent Node worker / raw TCP MySQL and Redis stack. No hosting purchase or public deployment has been made.
 
 **Your next step:** sign in to a hosting provider and supply a Linux VM with Docker, persistent storage and outbound TCP 587, plus a DNS name you control. Use an existing free VM if available; check the provider's current pricing yourself before provisioning. A paid machine has not been authorized or created. Once a host/account is connected, this configuration can be deployed there.

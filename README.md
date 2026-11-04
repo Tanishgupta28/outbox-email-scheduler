@@ -79,7 +79,7 @@ flowchart LR
 1. `frontend/main.tsx` handles login, composing, date conversion and table refresh.
 2. `backend/src/server.ts` checks the session, validates the request and commits an email row before touching Redis. The insert itself is an atomic MySQL write.
 3. `backend/src/queue.ts` adds `email-<database UUID>` as the stable BullMQ job ID, with a delay until the stored due time. If Redis is unavailable, the API still returns the saved record with `queuePending=true`; the UI explains recovery is pending.
-4. A worker takes a due job subject to the shared queue rate limit. `worker.ts` acquires a MySQL advisory lock for that email, checks terminal state and increments the persisted attempt counter before SMTP.
+4. A worker takes a due job subject to the shared queue rate limit. `worker.ts` acquires a MySQL advisory lock for that email, checks terminal state and atomically claims the row while incrementing the persisted attempt counter before SMTP. Cancellation competes with this claim in MySQL.
 5. `mail.ts` sends plain-text content through Nodemailer. On acceptance the worker saves `sent_at`, `preview_url` and `sent`. On error it records a retry or terminal failure. The UI's next poll moves the same ID into Sent or Failed.
 
 Read these files in that order for an interview. `auth.ts` contains password hashing; `migrate.ts` applies versioned SQL and seeds the two demo identities. Migration DDL is idempotent because MySQL DDL implicitly commits; run one migration process per deployment.
@@ -93,6 +93,16 @@ The API and worker each run a non-overlapping recovery loop (default every 3 sec
 Delivery is **at-least-once with a bounded attempt budget**, not exactly-once. If the worker dies immediately after SMTP acceptance but before saving `sent`, the database cannot know whether the message was accepted. BullMQ recovers a stalled job and may send it again. A stable Message-ID is reused but SMTP does not guarantee deduplication. The database attempt counter prevents unlimited sends even after queue loss. The final failure can therefore mean “outcome unknown,” not necessarily “no email was accepted.” Advisory locks reduce concurrent duplicates while the MySQL connection is alive; they cannot make SMTP and MySQL atomic. The crash-after-acceptance window is explained, not claimed as eliminated or exhaustively fault-injected.
 
 To strengthen this in a real product, use a delivery provider with an idempotency key and reconcile provider receipts. Exact delivery times are best effort: downtime, retry backoff and rate limits can make them later, never deliberately earlier.
+
+## Cancelling an email and correcting a recipient
+
+In Scheduled, **Cancel email** is available until the first delivery attempt. The confirmation includes the subject; dismissing it makes no request. Success shows **Email cancelled.** and removes the row from Scheduled. The record remains in MySQL with terminal status `cancelled`, so refreshing or restarting cannot restore it to Scheduled.
+
+`POST /api/emails/:id/cancel` requires the existing session and origin checks. It returns 200 for a successful or repeated cancellation, 404 for a missing or another user's email, and 409 when delivery has already been claimed or finished. Cancellation and the worker claim use conditional updates on the same database row: only the winner can proceed. Retrying emails with prior attempts are too late to cancel because an earlier SMTP outcome may be unknown. Queue removal is best effort; the worker checks and atomically claims database state before entering the transport even when a cancelled job remains active in Redis.
+
+Recovery scans only scheduled/processing rows. Enqueue rechecks the current row under a transaction lock before adding a missing job, preventing stale recovery snapshots from restoring cancelled jobs. Migration `002_cancelled_status.sql` appends the enum value without replacing records. **Upgrade API and worker together**, stopping old processes before enabling cancellation; see [deployment upgrade steps](docs/deployment.md#upgrading-for-cancellation).
+
+Malformed recipients show **Please enter a valid email address.** in one accessible alert popup for six seconds. Button and Enter submissions use the same validation; another invalid submission restarts the timer. The draft stays open and focused on the recipient. The form uses `noValidate` to reach the React handler, then explicitly calls `reportValidity()` for the remaining native constraints; backend Zod validation still protects direct requests.
 
 ## Rate limits, concurrency and retries
 
@@ -115,12 +125,13 @@ Other settings: `DATABASE_URL` selects MySQL; `REDIS_URL` selects Redis; `QUEUE_
 |---|---|---|
 | Demo login and isolation | Scrypt passwords, persistent hashed sessions, user-scoped SELECT | Login, identity display, logout |
 | Scheduling | Validated future UTC time, MySQL insert, stable BullMQ ID | Responsive compose dialog, local time zone, immediate Scheduled row |
+| Cancellation | Owner-scoped atomic state change, worker claim guard, terminal recovery exclusion | Subject confirmation, success notice, row removed after confirmation from API |
 | Durable recovery | AOF Redis, named volumes, MySQL reconciliation | Refresh/re-login reads authoritative status |
 | Delivery | Separate worker, Ethereal SMTP, saved accepted time and preview | Scheduled, Sent and Failed tables, attempt count, preview link |
 | Throughput | Configurable global limiter, concurrency and exponential retries | Batch schedules visibly spread over time |
 | Failure handling | Bounded attempts, sanitized errors, stalled-job reconciliation | Honest error and queue-pending notices |
 
-Shortcuts: public demo accounts rather than OAuth or registration; plain text only; one recipient per message; no attachments, cancellation, editing, bulk CSV import or manual retry. Polling is used instead of WebSockets. The inbox list is unpaginated for this small assignment; recovery itself is paginated. API rate limiting is process-local abuse protection, whereas delivery rate limiting is shared in Redis. No universal retry button avoids accidentally re-sending an ambiguously accepted email. User content is rendered as text by React. Preview URLs are effectively bearer links and should be treated as private demo data.
+Shortcuts: public demo accounts rather than OAuth or registration; plain text only; one recipient per message; no attachments, editing, bulk CSV import or manual retry. Polling is used instead of WebSockets. The inbox list is unpaginated for this small assignment; recovery itself is paginated. API rate limiting is process-local abuse protection, whereas delivery rate limiting is shared in Redis. No universal retry button avoids accidentally re-sending an ambiguously accepted email. User content is rendered as text by React. Preview URLs are effectively bearer links and should be treated as private demo data.
 
 ## Tests
 
@@ -137,6 +148,10 @@ npm.cmd run test:ethereal
 ```
 
 Tests create a uniquely named `outbox_test_<timestamp>` MySQL database and queue; they never use the demo database's records. The local default admin URL is `mysql://root:outbox_root_local@127.0.0.1:3307/mysql`; set `TEST_ADMIN_DATABASE_URL` if your local setup differs. Each run removes only its own database and queue keys, never `FLUSHDB`. Do not run the two suites simultaneously because they share test port 3002.
+
+The cancellation coverage checks authentication, cross-user denial, repeated requests, both orders of a real API/worker row-lock race, and a cancelled job retained during Redis cleanup failure. Chromium cancels through the UI, reloads, restarts API/worker, waits past due time, and checks that the fake mail transport was never entered. Ordinary uncancelled schedules still deliver after restart.
+
+The recipient test uses Playwright's browser clock: the alert is visible at five seconds and gone by seven; resubmitting an invalid recipient resets the deadline, with checks at 5,999 and 6,000 milliseconds. The composer retains its draft. Before correcting only the recipient and submitting successfully, the test restores real browser time and checks the unchanged delivery time against both the browser clock and the API's real HTTP Date. This avoids confusing virtual popup time with the backend's actual scheduling clock.
 
 `tests/integration.ts` starts compiled API/worker processes, force-kills and restarts both before due time and after a due time passes, verifies SQL-success/enqueue-failure recovery, validation, sessions, isolation, a five-message rate-limited batch and bounded failures. Playwright runs login → compose → Scheduled → reload → Sent → logout/login and checks mobile overflow. Default tests replace **only SMTP** with a fake transport. `test:ethereal` uses real SMTP, verifies a real preview URL, opens the preview in Chromium, and deliberately supplies invalid SMTP credentials for its failure test. Reports and screenshots are generated under ignored `test-results/`. See [docs/test-results.md](docs/test-results.md) for the actual execution record and limits.
 

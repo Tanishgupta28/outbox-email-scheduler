@@ -12,7 +12,7 @@ export interface Email extends RowDataPacket {
   subject: string;
   body: string;
   scheduled_at: Date;
-  status: "scheduled" | "processing" | "sent" | "failed";
+  status: "scheduled" | "processing" | "sent" | "failed" | "cancelled";
   attempts: number;
   sent_at: Date | null;
   preview_url: string | null;

@@ -1,4 +1,27 @@
-# Execution record — 3 November 2026
+# Execution record
+
+## Cancellation and recipient popup — 4 November 2026
+
+`npm.cmd run build` and `npm.cmd test` passed on Windows with real MySQL 8.4, Redis 7.4, separate API/worker processes and Chromium. All **14 grouped checks** passed; only SMTP was faked. The previous eight-check suite also passed before the new coverage was added. `git diff --check` passed. Vite emitted harmless third-party Zod comment-annotation warnings and completed successfully.
+
+On resuming the interrupted work, the original command's remaining output was recovered: it exited **0**, with all 14 checks passing. Its saved report also recorded success. A fresh run of the unchanged files again passed all 14 checks with exit **0**, captured in `test-results/resume-baseline.log` and `resume-baseline-exit.txt`. No original test failure was reproduced or present in the recovered output; the interruption had left the command's completion unreported. Docker's existing local MySQL/Redis services were healthy, so no prerequisite repair was necessary.
+
+After strengthening the retained-draft and real-clock assertions, the final build exited **0** and the complete final suite passed **14/14** checks, exiting **0** at `2026-11-04T13:24:20Z`. Full output is captured in `test-results/final-build.log`, `final-suite.log`, and `final-suite-exit.txt`. The final five-email rate-limit spread was 5,032 ms. The suite used only its uniquely named local test database and queue; production records were untouched.
+
+The new coverage verifies:
+
+- Upgrading the original schema preserves an existing email exactly; running migrations again is safe.
+- Cancellation requires authentication and ownership. Another user's or an unknown email returns 404. Concurrent and repeated cancellations return success, while sent/failed emails return 409. The delayed Redis job is removed.
+- Two deterministic API/worker races use a third MySQL connection to hold a row lock and inspect actual InnoDB lock waits. When cancellation queues first, the worker's stale pre-cancellation read cannot lead to a transport call. When the worker claim queues first, cancellation returns 409 and delivery completes.
+- With the API pointed at unavailable Redis, cancellation still succeeds in MySQL while the job remains queued. After API/worker restart, that job completes without entering the transport. Removing it afterward and waiting through recovery cycles does not recreate it.
+- Chromium checks the confirmation subject and dismissal, then confirms cancellation, reloads, restarts both processes, waits beyond due time, and reloads again. The row stays cancelled with zero attempts, no sent timestamp, no queue job and no fake transport-entry log.
+- Chromium uses deterministic `page.clock` timers: the alert is visible at five seconds and hidden at seven. A repeated Enter submission restarts the timer without stacking alerts; it is still visible at 5,999 ms and hidden at 6,000 ms after that submission. All draft values and recipient focus are preserved. Required subject, message and delivery time still block submission.
+- After restoring real browser time, correcting only the recipient in that same draft returns HTTP 201 and creates the matching Scheduled row. The unchanged delivery time is explicitly checked against browser time and the backend's real HTTP Date (plus the local Node clock); the saved timestamp, subject and body match the draft.
+- The original restart, queue outage, delivery, bounded failure, two-worker rate limit, browser flow and mobile overflow checks still pass.
+
+Raw evidence is in ignored `test-results/fake-report.json`, `fake-process.log`, and `invalid-recipient-popup.png`; the popup screenshot was visually inspected. These changes have **not been deployed** to the supplied live app, and real Ethereal SMTP was not rerun in this session. See [the coordinated upgrade procedure](deployment.md#upgrading-for-cancellation) before deploying the migration and new API/worker together.
+
+## Original execution — 3 November 2026
 
 Tests ran on Tanish's Windows machine in PowerShell with Node 22.18.0, Docker Desktop 28.3.2, MySQL 8.4 and Redis 7.4. Records used unique `outbox_test_<timestamp>` databases and queue namespaces, removed after each run. The separate backend lab was not changed. Raw reports, screenshots and sanitized process logs are in ignored `test-results/`.
 

@@ -14,18 +14,42 @@ export async function enqueue(email: Email) {
   // BullMQ waits for initial Redis readiness. Fail fast here so a Redis outage
   // cannot hold the HTTP response open after the database has committed.
   if (redis.status !== "ready") throw new Error("Queue is not ready");
-  await queue.add(
-    "deliver",
-    { emailId: email.id },
-    {
-      jobId: `email-${email.id}`,
-      delay: Math.max(0, email.scheduled_at.getTime() - Date.now()),
-      attempts: config.MAX_ATTEMPTS,
-      backoff: { type: "exponential", delay: config.RETRY_DELAY_MS },
-      removeOnComplete: { age: 86400 },
-      removeOnFail: false,
-    },
-  );
+  const sql = await db.getConnection();
+  try {
+    await sql.beginTransaction();
+    // Re-read under a row lock: a reconciler's scanned row may be stale.
+    // Holding this lock through enqueue orders it before/after cancellation,
+    // so recovery cannot recreate a job after cancellation commits.
+    const [rows] = await sql.query<Email[]>(
+      "SELECT * FROM emails WHERE id=? FOR UPDATE",
+      [email.id],
+    );
+    const current = rows[0];
+    if (current && ["scheduled", "processing"].includes(current.status))
+      await queue.add(
+        "deliver",
+        { emailId: email.id },
+        {
+          jobId: `email-${email.id}`,
+          delay: Math.max(0, current.scheduled_at.getTime() - Date.now()),
+          attempts: config.MAX_ATTEMPTS,
+          backoff: { type: "exponential", delay: config.RETRY_DELAY_MS },
+          removeOnComplete: { age: 86400 },
+          removeOnFail: false,
+        },
+      );
+    await sql.commit();
+  } catch (error) {
+    await sql.rollback();
+    throw error;
+  } finally {
+    sql.release();
+  }
+}
+export async function removeQueuedEmail(id: string) {
+  if (redis.status !== "ready") throw new Error("Queue is not ready");
+  const job = await queue.getJob(`email-${id}`);
+  if (job) await job.remove();
 }
 // MySQL rows are the durable outbox. Stable IDs make repeated enqueue safe.
 // Scan in pages so an old pending row cannot starve newer schedules.

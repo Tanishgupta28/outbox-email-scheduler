@@ -385,6 +385,17 @@ footer span {
   padding: 20px;
   backdrop-filter: blur(3px);
 }
+.recipient-popup {
+  position: fixed;
+  z-index: 10;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100vw - 40px);
+  border: 1px solid #d99080;
+  box-shadow: 0 8px 30px #172b2330;
+}
 .modal {
   background: white;
   border-radius: 16px;

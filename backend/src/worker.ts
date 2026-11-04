@@ -1,5 +1,6 @@
 import { Worker, UnrecoverableError } from "bullmq";
 import { Redis } from "ioredis";
+import type { ResultSetHeader } from "mysql2/promise";
 import { config } from "./config.js";
 import { db, type Email } from "./db.js";
 import { queue, redis, startReconciler } from "./queue.js";
@@ -25,21 +26,23 @@ const worker = new Worker(
         [job.data.emailId],
       );
       const email = rows[0];
-      if (!email || email.status === "sent" || email.status === "failed")
-        return;
+      if (!email || !["scheduled", "processing"].includes(email.status)) return;
       if (email.scheduled_at.getTime() > Date.now())
         throw new Error("Schedule is not due yet");
       if (email.attempts >= config.MAX_ATTEMPTS) {
         await sql.query(
-          "UPDATE emails SET status='failed',last_error='Attempt budget exhausted; prior SMTP outcome may be unknown.' WHERE id=?",
+          "UPDATE emails SET status='failed',last_error='Attempt budget exhausted; prior SMTP outcome may be unknown.' WHERE id=? AND status IN ('scheduled','processing')",
           [email.id],
         );
         throw new UnrecoverableError("Attempt budget exhausted");
       }
-      await sql.query(
-        "UPDATE emails SET status='processing',attempts=attempts+1 WHERE id=?",
-        [email.id],
+      const [claim] = await sql.query<ResultSetHeader>(
+        "UPDATE emails SET status='processing',attempts=attempts+1 WHERE id=? AND status IN ('scheduled','processing') AND attempts=?",
+        [email.id, email.attempts],
       );
+      // Cancellation may have committed since SELECT. Never call the transport
+      // unless this atomic claim wins; cancelled rows stay terminal on restart.
+      if (!claim.affectedRows) return;
       try {
         const preview = await deliver(email);
         await sql.query(
